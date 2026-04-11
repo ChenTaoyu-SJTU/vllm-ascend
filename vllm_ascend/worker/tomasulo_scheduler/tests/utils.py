@@ -47,6 +47,9 @@ def init_worker_env_and_config(
 
     engine_args = build_engine_args(cli_args_dict)
     vllm_config = engine_args.create_engine_config()
+    vllm_config.parallel_config._data_parallel_master_port_list = [
+        "32135"
+    ]
     local_rank = rank % torch.npu.device_count()
     return vllm_config, local_rank
 
@@ -132,7 +135,6 @@ def worker_process_fn(
     distributed_init_method: str,
     cli_args_dict: dict,
     error_queue: Queue,
-    result_queue: Queue,
 ):
     """
     Target function for each spawned worker process.
@@ -148,10 +150,6 @@ def worker_process_fn(
             worker, kv_cache_config = create_and_init_worker(
                 vllm_config, local_rank, rank, distributed_init_method,
             )
-            result_queue.put(("init_device_ok", rank))
-            result_queue.put(("load_model_ok", rank))
-            result_queue.put(("memory_ok", rank))
-            result_queue.put(("kv_cache_ok", rank))
 
             block_size = (
                 kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
@@ -164,14 +162,15 @@ def worker_process_fn(
             )
 
             exec_output = worker.execute_model(scheduler_output)
-            result_queue.put(("execute_model_ok", rank, exec_output is None))
+            assert exec_output is None, (
+                f"Rank {rank}: execute_model should return None"
+            )
 
             sample_output = worker.sample_tokens(grammar_output=None)
-            result_queue.put((
-                "sample_tokens_ok", rank, sample_output is not None
-            ))
-
-            result_queue.put(("all_done", rank))
+            if rank == 0:
+                assert sample_output is not None, (
+                    "Rank 0 (driver): sample_tokens should return non-None"
+                )
 
     except Exception as e:
         error_queue.put((rank, f"{type(e).__name__}: {e}", traceback.format_exc()))
