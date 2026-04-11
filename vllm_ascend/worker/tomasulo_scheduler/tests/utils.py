@@ -14,6 +14,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.logger import logger
 
 
 def build_engine_args(cli_args_dict: dict) -> EngineArgs:
@@ -47,6 +48,7 @@ def init_worker_env_and_config(
 
     engine_args = build_engine_args(cli_args_dict)
     vllm_config = engine_args.create_engine_config()
+    # This is a workaround when using data parallel in vllm parallel_state.py
     vllm_config.parallel_config._data_parallel_master_port_list = [
         "32135"
     ]
@@ -129,7 +131,7 @@ def build_scheduler_output(
     )
 
 
-def worker_process_fn(
+def worker_init_and_execute(
     rank: int,
     world_size: int,
     distributed_init_method: str,
@@ -147,6 +149,7 @@ def worker_process_fn(
         )
 
         with set_current_vllm_config(vllm_config):
+            # Do worker initialization
             worker, kv_cache_config = create_and_init_worker(
                 vllm_config, local_rank, rank, distributed_init_method,
             )
@@ -154,6 +157,8 @@ def worker_process_fn(
             block_size = (
                 kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
             )
+
+            # Do execute_model + sample_tokens test
             prompt_token_ids = list(range(1, 33))  # 32 dummy tokens
             scheduler_output = build_scheduler_output(
                 prompt_token_ids=prompt_token_ids,
@@ -162,15 +167,17 @@ def worker_process_fn(
             )
 
             exec_output = worker.execute_model(scheduler_output)
-            assert exec_output is None, (
-                f"Rank {rank}: execute_model should return None"
-            )
-
             sample_output = worker.sample_tokens(grammar_output=None)
-            if rank == 0:
-                assert sample_output is not None, (
-                    "Rank 0 (driver): sample_tokens should return non-None"
-                )
+
+            assert exec_output is None, \
+                f"Rank {rank}: execute_model should return None"
+            assert sample_output is not None, "sample_tokens should return non-None"
+            logger.info(f"Rank {rank}: sample_tokens output: \
+                        {sample_output.get_output().sampled_token_ids}")
 
     except Exception as e:
         error_queue.put((rank, f"{type(e).__name__}: {e}", traceback.format_exc()))
+
+# TODO: Implement the model_runner_forward test
+def model_runner_forward():
+    pass

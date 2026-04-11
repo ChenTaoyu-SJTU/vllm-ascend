@@ -3,7 +3,7 @@ import socket
 
 import pytest
 
-from vllm_ascend.worker.tomasulo_scheduler.tests.utils import worker_process_fn
+from vllm_ascend.worker.tomasulo_scheduler.tests.utils import worker_init_and_execute
 
 
 def find_free_port() -> int:
@@ -18,9 +18,9 @@ def test_worker_init_and_execute(engine_args_dict):
     initialization sequence, then execute_model + sample_tokens
     on a dummy prefill request.
     """
-    tp = engine_args_dict["tensor_parallel_size"]
-    dp = engine_args_dict["data_parallel_size"]
-    world_size = tp * dp
+    tp_size = engine_args_dict["tensor_parallel_size"]
+    dp_size = engine_args_dict["data_parallel_size"]
+    world_size = tp_size * dp_size
 
     distributed_init_method = f"tcp://127.0.0.1:{find_free_port()}"
 
@@ -30,7 +30,7 @@ def test_worker_init_and_execute(engine_args_dict):
     processes = []
     for rank in range(world_size):
         p = ctx.Process(
-            target=worker_process_fn,
+            target=worker_init_and_execute,
             args=(
                 rank,
                 world_size,
