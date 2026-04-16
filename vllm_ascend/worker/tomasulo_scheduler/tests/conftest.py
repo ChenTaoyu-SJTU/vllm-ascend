@@ -32,5 +32,5 @@ def engine_args_dict(request):
         "max_model_len": request.config.getoption("--max-model-len"),
         "compilation_config": json.loads(comp_cfg) if comp_cfg else {},
         "enforce_eager": True,
-        "load_format": "dummy",
+        "load_format": "auto",
     }
