@@ -62,9 +62,13 @@ def init_worker_env_and_config(
     rank_within_dp: int,
     tp_size: int,
     dp_rank: int,
-    cli_args_dict: dict,
+    vllm_config: VllmConfig,
 ) -> tuple[VllmConfig, int]:
-    """Set up env vars, create VllmConfig, and compute local_rank.
+    """Set up env vars, adjust VllmConfig per-rank, and compute local_rank.
+
+    Receives a VllmConfig created in the parent process (shared via pickle),
+    so all workers have the same _data_parallel_master_port_list and avoid
+    port conflicts during init_distributed_environment().
 
     For Dense models, each DP replica is an independent engine with
     world_size=tp_size and data_parallel_size reset to 1.
@@ -81,13 +85,7 @@ def init_worker_env_and_config(
     os.environ["WORLD_SIZE"] = str(tp_size)
     os.environ["VLLM_USE_V1"] = "1"
 
-    engine_args = build_engine_args(cli_args_dict)
-    vllm_config = engine_args.create_engine_config()
-    vllm_config.parallel_config._data_parallel_master_port_list = [
-        "32135"
-    ]
-
-    is_moe = cli_args_dict.get("enable_expert_parallel", False)
+    is_moe = vllm_config.parallel_config.enable_expert_parallel
     if is_moe:
         vllm_config.parallel_config.data_parallel_rank = dp_rank
     else:
@@ -180,7 +178,7 @@ def worker_init_and_execute(
     tp_size: int,
     dp_rank: int,
     distributed_init_method: str,
-    cli_args_dict: dict,
+    vllm_config: VllmConfig,
     error_queue: Queue,
 ):
     """
@@ -190,7 +188,7 @@ def worker_init_and_execute(
     """
     try:
         vllm_config, local_rank = init_worker_env_and_config(
-            rank_within_dp, tp_size, dp_rank, cli_args_dict,
+            rank_within_dp, tp_size, dp_rank, vllm_config,
         )
 
         with set_current_vllm_config(vllm_config):
@@ -428,12 +426,12 @@ def model_runner_forward(
     tp_size: int,
     dp_rank: int,
     distributed_init_method: str,
-    cli_args_dict: dict,
+    vllm_config: VllmConfig,
     error_queue: Queue,
 ):
     try:
         vllm_config, local_rank = init_worker_env_and_config(
-            rank_within_dp, tp_size, dp_rank, cli_args_dict,
+            rank_within_dp, tp_size, dp_rank, vllm_config,
         )
 
         with set_current_vllm_config(vllm_config):
@@ -526,6 +524,11 @@ def basic_test(engine_args_dict: dict, test_func: Callable):
     """
     Spawn worker(s) via multiprocessing, matching vllm serve behavior:
 
+    The VllmConfig is created once in the parent process so that all
+    workers share the same _data_parallel_master_port_list (populated
+    by ParallelConfig.__post_init__). This avoids port conflicts that
+    would occur if each worker called create_engine_config() independently.
+
     Dense models: each DP replica is an independent engine with its own
     distributed world (world_size=tp_size, separate init method per replica).
 
@@ -537,44 +540,29 @@ def basic_test(engine_args_dict: dict, test_func: Callable):
     dp_size = engine_args_dict["data_parallel_size"]
     is_moe = engine_args_dict.get("enable_expert_parallel", False)
 
+    engine_args = build_engine_args(engine_args_dict)
+    vllm_config = engine_args.create_engine_config()
+
     ctx = mp.get_context("spawn")
     error_queue = ctx.Queue()
     processes = []
 
-    if is_moe:
-        distributed_init_method = f"tcp://127.0.0.1:{find_free_port()}"
-        for dp_rank in range(dp_size):
-            for rank_within_dp in range(tp_size):
-                p = ctx.Process(
-                    target=test_func,
-                    args=(
-                        rank_within_dp,
-                        tp_size,
-                        dp_rank,
-                        distributed_init_method,
-                        engine_args_dict,
-                        error_queue,
-                    ),
-                )
-                p.start()
-                processes.append(p)
-    else:
-        for dp_rank in range(dp_size):
-            init_method = f"tcp://127.0.0.1:{find_free_port()}"
-            for rank_within_dp in range(tp_size):
-                p = ctx.Process(
-                    target=test_func,
-                    args=(
-                        rank_within_dp,
-                        tp_size,
-                        dp_rank,
-                        init_method,
-                        engine_args_dict,
-                        error_queue,
-                    ),
-                )
-                p.start()
-                processes.append(p)
+    for dp_rank in range(dp_size):
+        init_method = f"tcp://127.0.0.1:{find_free_port()}"
+        for rank_within_dp in range(tp_size):
+            p = ctx.Process(
+                target=test_func,
+                args=(
+                    rank_within_dp,
+                    tp_size,
+                    dp_rank,
+                    init_method,
+                    vllm_config,
+                    error_queue,
+                ),
+            )
+            p.start()
+            processes.append(p)
 
     for p in processes:
         p.join(timeout=600)
