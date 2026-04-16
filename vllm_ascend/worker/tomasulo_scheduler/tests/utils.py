@@ -59,27 +59,44 @@ def build_engine_args(cli_args_dict: dict) -> EngineArgs:
 
 
 def init_worker_env_and_config(
-    rank: int,
-    world_size: int,
+    rank_within_dp: int,
+    tp_size: int,
+    dp_rank: int,
     cli_args_dict: dict,
 ) -> tuple[VllmConfig, int]:
     """Set up env vars, create VllmConfig, and compute local_rank.
 
+    For Dense models, each DP replica is an independent engine with
+    world_size=tp_size and data_parallel_size reset to 1.
+
+    For MoE models, world_size=tp_size (single DP replica view) and
+    data_parallel_rank is preserved so that init_distributed_environment()
+    can expand to the global rank via dp_rank * world_size + rank.
+
     Must be called at the start of every spawned worker process,
     before set_current_vllm_config and create_and_init_worker.
     """
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["RANK"] = str(rank_within_dp)
+    os.environ["LOCAL_RANK"] = str(rank_within_dp)
+    os.environ["WORLD_SIZE"] = str(tp_size)
     os.environ["VLLM_USE_V1"] = "1"
 
     engine_args = build_engine_args(cli_args_dict)
     vllm_config = engine_args.create_engine_config()
-    # This is a workaround when using data parallel in vllm parallel_state.py
     vllm_config.parallel_config._data_parallel_master_port_list = [
         "32135"
     ]
-    local_rank = rank % torch.npu.device_count()
+
+    is_moe = cli_args_dict.get("enable_expert_parallel", False)
+    if is_moe:
+        vllm_config.parallel_config.data_parallel_rank = dp_rank
+    else:
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size_local = 1
+        vllm_config.parallel_config.data_parallel_rank = 0
+
+    npu_count = torch.npu.device_count()
+    local_rank = (dp_rank * tp_size + rank_within_dp) % npu_count
     return vllm_config, local_rank
 
 
@@ -159,8 +176,9 @@ def build_scheduler_output(
 
 
 def worker_init_and_execute(
-    rank: int,
-    world_size: int,
+    rank_within_dp: int,
+    tp_size: int,
+    dp_rank: int,
     distributed_init_method: str,
     cli_args_dict: dict,
     error_queue: Queue,
@@ -172,13 +190,13 @@ def worker_init_and_execute(
     """
     try:
         vllm_config, local_rank = init_worker_env_and_config(
-            rank, world_size, cli_args_dict,
+            rank_within_dp, tp_size, dp_rank, cli_args_dict,
         )
 
         with set_current_vllm_config(vllm_config):
-            # Do worker initialization
             worker, kv_cache_config = create_and_init_worker(
-                vllm_config, local_rank, rank, distributed_init_method,
+                vllm_config, local_rank, rank_within_dp,
+                distributed_init_method,
             )
 
             block_size = (
@@ -197,13 +215,19 @@ def worker_init_and_execute(
             sample_output = worker.sample_tokens(grammar_output=None)
 
             assert exec_output is None, \
-                f"Rank {rank}: execute_model should return None"
+                f"DP{dp_rank}-Rank{rank_within_dp}: execute_model should return None"
             assert sample_output is not None, "sample_tokens should return non-None"
-            logger.info(f"Rank {rank}: sample_tokens output: \
-                        {sample_output.get_output().sampled_token_ids}")
+            logger.info(
+                f"DP{dp_rank}-Rank{rank_within_dp}: sample_tokens output: "
+                f"{sample_output.get_output().sampled_token_ids}"
+            )
 
     except Exception as e:
-        error_queue.put((rank, f"{type(e).__name__}: {e}", traceback.format_exc()))
+        error_queue.put((
+            (dp_rank, rank_within_dp),
+            f"{type(e).__name__}: {e}",
+            traceback.format_exc(),
+        ))
 
 def register_forward_test_requests(
     model_runner,
@@ -400,20 +424,22 @@ def update_state_after_model_forward(
 
 
 def model_runner_forward(
-    rank: int,
-    world_size: int,
+    rank_within_dp: int,
+    tp_size: int,
+    dp_rank: int,
     distributed_init_method: str,
     cli_args_dict: dict,
     error_queue: Queue,
 ):
     try:
         vllm_config, local_rank = init_worker_env_and_config(
-            rank, world_size, cli_args_dict,
+            rank_within_dp, tp_size, dp_rank, cli_args_dict,
         )
 
         with set_current_vllm_config(vllm_config):
             worker, kv_cache_config = create_and_init_worker(
-                vllm_config, local_rank, rank, distributed_init_method,
+                vllm_config, local_rank, rank_within_dp,
+                distributed_init_method,
             )
 
             model_runner = worker.model_runner
@@ -452,7 +478,7 @@ def model_runner_forward(
             assert not torch.isnan(hidden_states).any()
             assert not torch.isinf(hidden_states).any()
             logger.info(
-                f"Rank {rank}: prefill passed, "
+                f"DP{dp_rank}-Rank{rank_within_dp}: prefill passed, "
                 f"hidden_states.shape={hidden_states.shape}"
             )
 
@@ -484,55 +510,82 @@ def model_runner_forward(
             assert not torch.isnan(hidden_states).any()
             assert not torch.isinf(hidden_states).any()
             logger.info(
-                f"Rank {rank}: decode passed, "
+                f"DP{dp_rank}-Rank{rank_within_dp}: decode passed, "
                 f"hidden_states.shape={hidden_states.shape}"
             )
 
     except Exception as e:
-        error_queue.put(
-            (rank, f"{type(e).__name__}: {e}", traceback.format_exc())
-        )
+        error_queue.put((
+            (dp_rank, rank_within_dp),
+            f"{type(e).__name__}: {e}",
+            traceback.format_exc(),
+        ))
 
 
 def basic_test(engine_args_dict: dict, test_func: Callable):
     """
-    Spawn worker(s) via multiprocessing, run the full NPUWorker
-    initialization sequence, then execute_model + sample_tokens
-    on a dummy prefill request.
+    Spawn worker(s) via multiprocessing, matching vllm serve behavior:
+
+    Dense models: each DP replica is an independent engine with its own
+    distributed world (world_size=tp_size, separate init method per replica).
+
+    MoE models: all DP replicas share one global distributed world;
+    init_distributed_environment() expands rank via
+    global_rank = dp_rank * tp_size + rank_within_dp.
     """
     tp_size = engine_args_dict["tensor_parallel_size"]
     dp_size = engine_args_dict["data_parallel_size"]
-    world_size = tp_size * dp_size
-
-    distributed_init_method = f"tcp://127.0.0.1:{find_free_port()}"
+    is_moe = engine_args_dict.get("enable_expert_parallel", False)
 
     ctx = mp.get_context("spawn")
     error_queue = ctx.Queue()
-
     processes = []
-    for rank in range(world_size):
-        p = ctx.Process(
-            target=test_func,
-            args=(
-                rank,
-                world_size,
-                distributed_init_method,
-                engine_args_dict,
-                error_queue,
-            ),
-        )
-        p.start()
-        processes.append(p)
+
+    if is_moe:
+        distributed_init_method = f"tcp://127.0.0.1:{find_free_port()}"
+        for dp_rank in range(dp_size):
+            for rank_within_dp in range(tp_size):
+                p = ctx.Process(
+                    target=test_func,
+                    args=(
+                        rank_within_dp,
+                        tp_size,
+                        dp_rank,
+                        distributed_init_method,
+                        engine_args_dict,
+                        error_queue,
+                    ),
+                )
+                p.start()
+                processes.append(p)
+    else:
+        for dp_rank in range(dp_size):
+            init_method = f"tcp://127.0.0.1:{find_free_port()}"
+            for rank_within_dp in range(tp_size):
+                p = ctx.Process(
+                    target=test_func,
+                    args=(
+                        rank_within_dp,
+                        tp_size,
+                        dp_rank,
+                        init_method,
+                        engine_args_dict,
+                        error_queue,
+                    ),
+                )
+                p.start()
+                processes.append(p)
 
     for p in processes:
         p.join(timeout=600)
 
-    # Collect errors
     errors = []
     while not error_queue.empty():
-        rank, msg, tb = error_queue.get_nowait()
-        errors.append(f"--- Rank {rank} ---\n{msg}\n{tb}")
+        identity, msg, tb = error_queue.get_nowait()
+        errors.append(f"--- {identity} ---\n{msg}\n{tb}")
     if errors:
         pytest.fail("Worker process(es) failed:\n" + "\n".join(errors))
 
-    print(f"\nAll {world_size} workers passed initialization and execution.")
+    total = tp_size * dp_size
+    mode = "MoE (shared world)" if is_moe else "Dense (independent replicas)"
+    print(f"\nAll {total} workers passed ({mode}, tp={tp_size}, dp={dp_size}).")
