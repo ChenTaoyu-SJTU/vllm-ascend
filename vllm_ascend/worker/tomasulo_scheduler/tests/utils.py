@@ -3,6 +3,7 @@ import os
 import traceback
 from multiprocessing.queues import Queue
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -14,12 +15,28 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.logger import logger
 import multiprocessing as mp
 import socket
 
 from typing import Callable
 import pytest
+
+
+class SimpleBlockAllocator:
+    def __init__(self, num_gpu_blocks: int, block_size: int):
+        self.num_gpu_blocks = num_gpu_blocks
+        self.block_size = block_size
+        self.next_block_id = 0
+
+    def allocate(self, num_new_blocks: int) -> list[int]:
+        block_ids = list(range(self.next_block_id, self.next_block_id + num_new_blocks))
+        self.next_block_id += num_new_blocks
+        assert self.next_block_id <= self.num_gpu_blocks, (
+            f"Allocated {self.next_block_id} blocks but only {self.num_gpu_blocks} available"
+        )
+        return block_ids
 
 
 def find_free_port() -> int:
@@ -188,10 +205,293 @@ def worker_init_and_execute(
     except Exception as e:
         error_queue.put((rank, f"{type(e).__name__}: {e}", traceback.format_exc()))
 
-# TODO: Implement the model_runner_forward test, which is similar to 
-# worker_init_and_execute() but use the model_runner._model_forward directly
-def model_runner_forward():
-    pass
+def register_forward_test_requests(
+    model_runner,
+    num_scheduled_tokens: dict[str, int],
+    allocator: SimpleBlockAllocator,
+    block_size: int,
+) -> tuple[list[str], dict[str, CachedRequestState]]:
+    req_ids = []
+    req_states = {}
+    for req_id, num_prompt_tokens in num_scheduled_tokens.items():
+        prompt_token_ids = list(range(1, num_prompt_tokens + 1))
+        num_blocks = math.ceil(num_prompt_tokens / block_size)
+        block_ids = (allocator.allocate(num_blocks),)
+
+        req_state = CachedRequestState(
+            req_id=req_id,
+            prompt_token_ids=prompt_token_ids,
+            mm_features=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            block_ids=block_ids,
+            num_computed_tokens=0,
+            output_token_ids=[0],
+        )
+        model_runner.input_batch.add_request(req_state)
+        model_runner.requests[req_id] = req_state
+        req_ids.append(req_id)
+        req_states[req_id] = req_state
+    return req_ids, req_states
+
+
+def prepare_forward_step(
+    model_runner,
+    num_scheduled_tokens: dict[str, int],
+):
+    from vllm_ascend.attention.attention_v1 import AscendAttentionState
+
+    num_reqs = model_runner.input_batch.num_reqs
+    req_ids = list(model_runner.input_batch.req_ids)
+    num_scheduled_per_req = np.array(
+        [num_scheduled_tokens[rid] for rid in req_ids], dtype=np.int32
+    )
+    total_num_tokens = int(num_scheduled_per_req.sum())
+    max_query_len = int(num_scheduled_per_req.max())
+
+    req_indices = np.repeat(np.arange(num_reqs), num_scheduled_per_req)
+    cu_num_tokens, arange = model_runner._get_cumsum_and_arange(
+        num_scheduled_per_req
+    )
+
+    positions_np = model_runner.positions.np[:total_num_tokens]
+    np.add(
+        model_runner.input_batch.num_computed_tokens_cpu[req_indices],
+        arange,
+        out=positions_np,
+    )
+
+    token_indices = (
+        positions_np
+        + req_indices * model_runner.input_batch.token_ids_cpu.shape[1]
+    )
+    torch.index_select(
+        model_runner.input_batch.token_ids_cpu_tensor.flatten(),
+        0,
+        torch.from_numpy(token_indices),
+        out=model_runner.input_ids.cpu[:total_num_tokens],
+    )
+
+    model_runner.query_start_loc.np[0] = 0
+    model_runner.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+    model_runner.query_start_loc.copy_to_gpu()
+    model_runner.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
+
+    model_runner.seq_lens.np[:num_reqs] = (
+        model_runner.input_batch.num_computed_tokens_cpu[:num_reqs]
+        + num_scheduled_per_req
+    )
+    model_runner.seq_lens.np[num_reqs:] = 0
+    model_runner.seq_lens.copy_to_gpu()
+
+    if max_query_len == 1:
+        model_runner.attn_state = AscendAttentionState.DecodeOnly
+    else:
+        model_runner.attn_state = AscendAttentionState.ChunkedPrefill
+
+    model_runner.input_batch.block_table.commit_block_table(num_reqs)
+    model_runner.input_batch.block_table.compute_slot_mapping(
+        req_indices, positions_np
+    )
+    model_runner.input_batch.block_table.commit_slot_mapping(total_num_tokens)
+
+    model_runner.input_ids.copy_to_gpu(total_num_tokens)
+    model_runner.positions.copy_to_gpu(total_num_tokens)
+
+    cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = (
+        model_runner._determine_batch_execution_and_padding(
+            num_tokens=total_num_tokens,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_np=num_scheduled_per_req,
+            max_num_scheduled_tokens=max_query_len,
+            use_cascade_attn=False,
+            force_eager=True,
+        )
+    )
+    num_tokens_padded = batch_desc.num_tokens
+
+    attn_metadata, _ = model_runner._build_attention_metadata(
+        num_tokens=total_num_tokens,
+        num_tokens_padded=num_tokens_padded,
+        num_reqs=num_reqs,
+        max_query_len=max_query_len,
+    )
+
+    return (
+        attn_metadata,
+        total_num_tokens,
+        num_tokens_padded,
+        cudagraph_mode,
+        batch_desc,
+        num_tokens_across_dp,
+    )
+
+
+def run_forward_step(
+    model_runner,
+    attn_metadata,
+    total_num_tokens: int,
+    num_tokens_padded: int,
+    cudagraph_mode,
+    batch_desc,
+    num_tokens_across_dp,
+) -> torch.Tensor:
+    from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+    from vllm_ascend.ops.rotary_embedding import update_cos_sin
+
+    positions_gpu = model_runner.positions.gpu[:num_tokens_padded]
+    update_cos_sin(positions_gpu)
+
+    input_ids = model_runner.input_ids.gpu[:num_tokens_padded]
+    positions = positions_gpu
+
+    with set_ascend_forward_context(
+        attn_metadata,
+        model_runner.vllm_config,
+        num_tokens=num_tokens_padded,
+        num_tokens_across_dp=num_tokens_across_dp,
+        aclgraph_runtime_mode=cudagraph_mode,
+        batch_descriptor=batch_desc,
+        num_actual_tokens=total_num_tokens,
+        model_instance=model_runner.model,
+        max_tokens_across_pcp=0,
+        skip_compiled=False,
+    ):
+        hidden_states = model_runner._model_forward(
+            num_tokens_padded,
+            input_ids,
+            positions,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+        )
+    return hidden_states
+
+
+def update_state_after_model_forward(
+    model_runner,
+    num_scheduled_tokens: dict[str, int],
+    allocator: SimpleBlockAllocator,
+    block_size: int,
+):
+    req_ids = list(model_runner.input_batch.req_ids)
+    for i, req_id in enumerate(req_ids):
+        num_new_tokens = num_scheduled_tokens[req_id]
+        old_computed = model_runner.input_batch.num_computed_tokens_cpu[i]
+        new_computed = old_computed + num_new_tokens
+        model_runner.input_batch.num_computed_tokens_cpu[i] = new_computed
+        model_runner.requests[req_id].num_computed_tokens = new_computed
+
+        dummy_output_token = 1
+        model_runner.input_batch.token_ids_cpu[i, new_computed] = (
+            dummy_output_token
+        )
+        model_runner.requests[req_id].output_token_ids.append(
+            dummy_output_token
+        )
+
+        next_seq_len = new_computed + 1
+        current_blocks = math.ceil(new_computed / block_size) if new_computed > 0 else 0
+        needed_blocks = math.ceil(next_seq_len / block_size)
+        if needed_blocks > current_blocks:
+            new_block_ids = allocator.allocate(needed_blocks - current_blocks)
+            model_runner.input_batch.block_table.append_row(
+                (new_block_ids,), i
+            )
+
+
+def model_runner_forward(
+    rank: int,
+    world_size: int,
+    distributed_init_method: str,
+    cli_args_dict: dict,
+    error_queue: Queue,
+):
+    try:
+        vllm_config, local_rank = init_worker_env_and_config(
+            rank, world_size, cli_args_dict,
+        )
+
+        with set_current_vllm_config(vllm_config):
+            worker, kv_cache_config = create_and_init_worker(
+                vllm_config, local_rank, rank, distributed_init_method,
+            )
+
+            model_runner = worker.model_runner
+            block_size = (
+                kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+            )
+            allocator = SimpleBlockAllocator(
+                kv_cache_config.num_blocks, block_size,
+            )
+
+            prefill_tokens = {"req_0": 4, "req_1": 3}
+            register_forward_test_requests(
+                model_runner, prefill_tokens, allocator, block_size,
+            )
+
+            (
+                attn_metadata,
+                total_num_tokens,
+                num_tokens_padded,
+                cudagraph_mode,
+                batch_desc,
+                num_tokens_across_dp,
+            ) = prepare_forward_step(model_runner, prefill_tokens)
+
+            hidden_states = run_forward_step(
+                model_runner,
+                attn_metadata,
+                total_num_tokens,
+                num_tokens_padded,
+                cudagraph_mode,
+                batch_desc,
+                num_tokens_across_dp,
+            )
+            assert isinstance(hidden_states, torch.Tensor)
+            assert hidden_states.shape[0] >= total_num_tokens
+            assert not torch.isnan(hidden_states).any()
+            assert not torch.isinf(hidden_states).any()
+            logger.info(
+                f"Rank {rank}: prefill passed, "
+                f"hidden_states.shape={hidden_states.shape}"
+            )
+
+            update_state_after_model_forward(
+                model_runner, prefill_tokens, allocator, block_size,
+            )
+
+            decode_tokens = {"req_0": 1, "req_1": 1}
+            (
+                attn_metadata,
+                total_num_tokens,
+                num_tokens_padded,
+                cudagraph_mode,
+                batch_desc,
+                num_tokens_across_dp,
+            ) = prepare_forward_step(model_runner, decode_tokens)
+
+            hidden_states = run_forward_step(
+                model_runner,
+                attn_metadata,
+                total_num_tokens,
+                num_tokens_padded,
+                cudagraph_mode,
+                batch_desc,
+                num_tokens_across_dp,
+            )
+            assert isinstance(hidden_states, torch.Tensor)
+            assert hidden_states.shape[0] >= total_num_tokens
+            assert not torch.isnan(hidden_states).any()
+            assert not torch.isinf(hidden_states).any()
+            logger.info(
+                f"Rank {rank}: decode passed, "
+                f"hidden_states.shape={hidden_states.shape}"
+            )
+
+    except Exception as e:
+        error_queue.put(
+            (rank, f"{type(e).__name__}: {e}", traceback.format_exc())
+        )
 
 
 def basic_test(engine_args_dict: dict, test_func: Callable):
