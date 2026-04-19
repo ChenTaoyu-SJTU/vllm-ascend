@@ -91,7 +91,7 @@ class NPUWorker(WorkerBase):
                 "COMPILE_CUSTOM_KERNELS is set to False. "
                 "In most scenarios, without custom kernels, vllm-ascend will not function correctly."
             )
-
+        logger.info(f"local_rank: {local_rank}, rank: {rank}")
         # register patch for vllm
         from vllm_ascend.utils import adapt_patch
 
