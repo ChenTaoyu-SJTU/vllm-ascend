@@ -59,12 +59,17 @@ def build_engine_args(cli_args_dict: dict) -> EngineArgs:
 
 
 def init_worker_env_and_config(
-    rank_within_dp: int,
+    local_rank: int,
     tp_size: int,
     dp_rank: int,
     vllm_config: VllmConfig,
-) -> tuple[VllmConfig, int]:
-    """Set up env vars, adjust VllmConfig per-rank, and compute local_rank.
+) -> VllmConfig:
+    """Set up env vars and adjust VllmConfig per-rank.
+
+    Matches native vllm-ascend behavior where each DP replica runs in its
+    own engine process with ASCEND_RT_VISIBLE_DEVICES narrowed to the
+    tp_size cards that belong to that replica. Inside the replica,
+    local_rank indexes into those visible cards (0..tp_size-1).
 
     Receives a VllmConfig created in the parent process (shared via pickle),
     so all workers have the same _data_parallel_master_port_list and avoid
@@ -75,13 +80,21 @@ def init_worker_env_and_config(
 
     For MoE models, world_size=tp_size (single DP replica view) and
     data_parallel_rank is preserved so that init_distributed_environment()
-    can expand to the global rank via dp_rank * world_size + rank.
+    can expand to the global rank via dp_rank * world_size + local_rank.
 
     Must be called at the start of every spawned worker process,
-    before set_current_vllm_config and create_and_init_worker.
+    before any NPU call and before set_current_vllm_config /
+    create_and_init_worker.
     """
-    os.environ["RANK"] = str(rank_within_dp)
-    os.environ["LOCAL_RANK"] = str(rank_within_dp)
+    # Narrow visible NPUs to this DP replica's slice before any NPU op,
+    # so that torch.device(f"npu:{local_rank}") maps to a unique physical
+    # card. This mirrors native vllm-ascend's DPEngineCoreProc behavior
+    # (vllm/v1/engine/core.py: _set_cuda_visible_devices).
+    device_ids = range(dp_rank * tp_size, (dp_rank + 1) * tp_size)
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(str(i) for i in device_ids)
+
+    os.environ["RANK"] = str(local_rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(tp_size)
     os.environ["VLLM_USE_V1"] = "1"
 
@@ -93,9 +106,7 @@ def init_worker_env_and_config(
         vllm_config.parallel_config.data_parallel_size_local = 1
         vllm_config.parallel_config.data_parallel_rank = 0
 
-    npu_count = torch.npu.device_count()
-    local_rank = (dp_rank * tp_size + rank_within_dp) % npu_count
-    return vllm_config, local_rank
+    return vllm_config
 
 
 def create_and_init_worker(
@@ -174,7 +185,7 @@ def build_scheduler_output(
 
 
 def worker_init_and_execute(
-    rank_within_dp: int,
+    local_rank: int,
     tp_size: int,
     dp_rank: int,
     distributed_init_method: str,
@@ -187,13 +198,13 @@ def worker_init_and_execute(
     execute_model + sample_tokens on a dummy prefill request.
     """
     try:
-        vllm_config, local_rank = init_worker_env_and_config(
-            rank_within_dp, tp_size, dp_rank, vllm_config,
+        vllm_config = init_worker_env_and_config(
+            local_rank, tp_size, dp_rank, vllm_config,
         )
 
         with set_current_vllm_config(vllm_config):
             worker, kv_cache_config = create_and_init_worker(
-                vllm_config, local_rank, rank_within_dp,
+                vllm_config, local_rank, local_rank,
                 distributed_init_method,
             )
 
@@ -213,16 +224,16 @@ def worker_init_and_execute(
             sample_output = worker.sample_tokens(grammar_output=None)
 
             assert exec_output is None, \
-                f"DP{dp_rank}-Rank{rank_within_dp}: execute_model should return None"
+                f"DP{dp_rank}-Rank{local_rank}: execute_model should return None"
             assert sample_output is not None, "sample_tokens should return non-None"
             logger.info(
-                f"DP{dp_rank}-Rank{rank_within_dp}: sample_tokens output: "
+                f"DP{dp_rank}-Rank{local_rank}: sample_tokens output: "
                 f"{sample_output.get_output().sampled_token_ids}"
             )
 
     except Exception as e:
         error_queue.put((
-            (dp_rank, rank_within_dp),
+            (dp_rank, local_rank),
             f"{type(e).__name__}: {e}",
             traceback.format_exc(),
         ))
@@ -422,7 +433,7 @@ def update_state_after_model_forward(
 
 
 def model_runner_forward(
-    rank_within_dp: int,
+    local_rank: int,
     tp_size: int,
     dp_rank: int,
     distributed_init_method: str,
@@ -430,13 +441,13 @@ def model_runner_forward(
     error_queue: Queue,
 ):
     try:
-        vllm_config, local_rank = init_worker_env_and_config(
-            rank_within_dp, tp_size, dp_rank, vllm_config,
+        vllm_config = init_worker_env_and_config(
+            local_rank, tp_size, dp_rank, vllm_config,
         )
 
         with set_current_vllm_config(vllm_config):
             worker, kv_cache_config = create_and_init_worker(
-                vllm_config, local_rank, rank_within_dp,
+                vllm_config, local_rank, local_rank,
                 distributed_init_method,
             )
 
@@ -476,7 +487,7 @@ def model_runner_forward(
             assert not torch.isnan(hidden_states).any()
             assert not torch.isinf(hidden_states).any()
             logger.info(
-                f"DP{dp_rank}-Rank{rank_within_dp}: prefill passed, "
+                f"DP{dp_rank}-Rank{local_rank}: prefill passed, "
                 f"hidden_states.shape={hidden_states.shape}"
             )
 
@@ -508,13 +519,13 @@ def model_runner_forward(
             assert not torch.isnan(hidden_states).any()
             assert not torch.isinf(hidden_states).any()
             logger.info(
-                f"DP{dp_rank}-Rank{rank_within_dp}: decode passed, "
+                f"DP{dp_rank}-Rank{local_rank}: decode passed, "
                 f"hidden_states.shape={hidden_states.shape}"
             )
 
     except Exception as e:
         error_queue.put((
-            (dp_rank, rank_within_dp),
+            (dp_rank, local_rank),
             f"{type(e).__name__}: {e}",
             traceback.format_exc(),
         ))
@@ -534,7 +545,7 @@ def basic_test(engine_args_dict: dict, test_func: Callable):
 
     MoE models: all DP replicas share one global distributed world;
     init_distributed_environment() expands rank via
-    global_rank = dp_rank * tp_size + rank_within_dp.
+    global_rank = dp_rank * tp_size + local_rank.
     """
     tp_size = engine_args_dict["tensor_parallel_size"]
     dp_size = engine_args_dict["data_parallel_size"]
@@ -549,11 +560,11 @@ def basic_test(engine_args_dict: dict, test_func: Callable):
 
     for dp_rank in range(dp_size):
         init_method = f"tcp://127.0.0.1:{find_free_port()}"
-        for rank_within_dp in range(tp_size):
+        for local_rank in range(tp_size):
             p = ctx.Process(
                 target=test_func,
                 args=(
-                    rank_within_dp,
+                    local_rank,
                     tp_size,
                     dp_rank,
                     init_method,
