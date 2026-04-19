@@ -1,0 +1,14 @@
+vllm serve /data01/cty/models/qwen3-30b-moe \
+    --load-format dummy \
+    --host 0.0.0.0 \
+    --port 8077 \
+    -dp 2 \
+    -tp 2 \
+    --seed 1024 \
+    --max-num-seqs 256 \
+    --enable-expert-parallel \
+    --trust-remote-code \
+    --no-enable-prefix-caching \
+    --gpu-memory-utilization 0.92 \
+    --max-model-len 12000 \
+    --max-num-batched-tokens 12288
