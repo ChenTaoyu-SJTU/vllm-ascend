@@ -531,6 +531,158 @@ def model_runner_forward(
         ))
 
 
+def build_tomasulo_input_batch(
+    model_runner,
+    attn_metadata,
+    total_num_tokens: int,
+    num_tokens_padded: int,
+    cudagraph_mode,
+    batch_desc,
+    num_tokens_across_dp,
+):
+    """Pack outputs of ``prepare_forward_step`` into a ``TomasuloInputBatch``.
+
+    No new compute; just slices the GPU buffers already filled by
+    ``prepare_forward_step`` and forwards the metadata tuple.
+    """
+    from vllm_ascend.worker.tomasulo_scheduler.input_batch import (
+        TomasuloInputBatch,
+    )
+
+    return TomasuloInputBatch(
+        input_ids=model_runner.input_ids.gpu[:num_tokens_padded],
+        positions=model_runner.positions.gpu[:num_tokens_padded],
+        attn_metadata=attn_metadata,
+        num_tokens_padded=num_tokens_padded,
+        num_tokens_across_dp=num_tokens_across_dp,
+        cudagraph_mode=cudagraph_mode,
+        batch_desc=batch_desc,
+        num_actual_tokens=total_num_tokens,
+    )
+
+
+def build_logits_indices(model_runner, num_reqs: int) -> torch.Tensor:
+    """Last token offset of each sequence in the concatenated batch.
+
+    Mirrors the default branch in ``NPUModelRunner._prepare_inputs``
+    (``model_runner_v1.py:828``):
+        ``logits_indices = query_start_loc.gpu[1 : num_reqs + 1] - 1``
+    """
+    return model_runner.query_start_loc.gpu[1 : num_reqs + 1] - 1
+
+
+def executor_forward(
+    local_rank: int,
+    tp_size: int,
+    dp_rank: int,
+    distributed_init_method: str,
+    vllm_config: VllmConfig,
+    error_queue: Queue,
+):
+    """Spawn target: drive ``TomasuloExecutor`` through prefill + decode.
+
+    Initialisation is identical to ``model_runner_forward``; the forward /
+    compute_logits / sample triplet is exercised on both a prefill step
+    ({"req_0": 4, "req_1": 3}) and a decode step ({"req_0": 1, "req_1": 1}).
+    """
+    from vllm_ascend.worker.tomasulo_scheduler.executor import TomasuloExecutor
+
+    try:
+        vllm_config = init_worker_env_and_config(
+            local_rank, tp_size, dp_rank, vllm_config,
+        )
+
+        with set_current_vllm_config(vllm_config):
+            worker, kv_cache_config = create_and_init_worker(
+                vllm_config, local_rank, local_rank,
+                distributed_init_method,
+            )
+
+            model_runner = worker.model_runner
+            executor = TomasuloExecutor(model_runner)
+            block_size = (
+                kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+            )
+            allocator = SimpleBlockAllocator(
+                kv_cache_config.num_blocks, block_size,
+            )
+            vocab_size = model_runner.input_batch.vocab_size
+
+            def _run_step(num_scheduled_tokens: dict[str, int], tag: str):
+                (
+                    attn_metadata,
+                    total_num_tokens,
+                    num_tokens_padded,
+                    cudagraph_mode,
+                    batch_desc,
+                    num_tokens_across_dp,
+                ) = prepare_forward_step(model_runner, num_scheduled_tokens)
+
+                # Rebuild SamplingMetadata now that input_batch state reflects
+                # the current requests (add_request bypasses _update_states).
+                model_runner.input_batch.refresh_metadata()
+
+                input_batch = build_tomasulo_input_batch(
+                    model_runner,
+                    attn_metadata,
+                    total_num_tokens,
+                    num_tokens_padded,
+                    cudagraph_mode,
+                    batch_desc,
+                    num_tokens_across_dp,
+                )
+
+                hidden_states = executor.forward(input_batch)
+                assert isinstance(hidden_states, torch.Tensor)
+                assert hidden_states.shape[0] >= total_num_tokens
+                assert not torch.isnan(hidden_states).any()
+                assert not torch.isinf(hidden_states).any()
+
+                num_reqs = model_runner.input_batch.num_reqs
+                logits_indices = build_logits_indices(model_runner, num_reqs)
+                logits = executor.compute_logits(hidden_states, logits_indices)
+                assert isinstance(logits, torch.Tensor)
+                assert logits.shape[0] == num_reqs
+                assert not torch.isnan(logits).any()
+                assert not torch.isinf(logits).any()
+
+                sampled = executor.sample(
+                    logits, model_runner.input_batch.sampling_metadata,
+                )
+                assert isinstance(sampled, torch.Tensor)
+                assert sampled.shape == (num_reqs, 1)
+                assert sampled.dtype == torch.int32
+                assert (sampled >= 0).all()
+                assert (sampled < vocab_size).all()
+
+                logger.info(
+                    f"DP{dp_rank}-Rank{local_rank}: {tag} passed, "
+                    f"hidden_states.shape={hidden_states.shape}, "
+                    f"logits.shape={logits.shape}, "
+                    f"sampled.shape={sampled.shape}"
+                )
+
+            prefill_tokens = {"req_0": 4, "req_1": 3}
+            register_forward_test_requests(
+                model_runner, prefill_tokens, allocator, block_size,
+            )
+            _run_step(prefill_tokens, "prefill")
+
+            update_state_after_model_forward(
+                model_runner, prefill_tokens, allocator, block_size,
+            )
+
+            decode_tokens = {"req_0": 1, "req_1": 1}
+            _run_step(decode_tokens, "decode")
+
+    except Exception as e:
+        error_queue.put((
+            (dp_rank, local_rank),
+            f"{type(e).__name__}: {e}",
+            traceback.format_exc(),
+        ))
+
+
 def basic_test(engine_args_dict: dict, test_func: Callable):
     """
     Spawn worker(s) via multiprocessing, matching vllm serve behavior:
