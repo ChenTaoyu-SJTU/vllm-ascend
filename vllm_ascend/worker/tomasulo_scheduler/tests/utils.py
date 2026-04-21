@@ -272,6 +272,86 @@ def prepare_forward_step(
     model_runner,
     num_scheduled_tokens: dict[str, int],
 ):
+    """Prepare all inputs and metadata for a single forward pass.
+
+    This function transforms scheduler output into the tensors and metadata
+    that the Ascend NPU model runner needs for one forward step.  It handles
+    both **prefill** (new tokens have query_len > 1) and **decode** (one new
+    token per request, query_len == 1).
+
+    Example
+    -------
+    Suppose three requests are registered and the scheduler decides to run::
+
+        num_scheduled_tokens = {"0": 3, "1": 2, "2": 5}
+
+    All requests start from ``num_computed_tokens = 0`` (pure prefill).
+
+    Step-by-step data transformation:
+
+    1. **Basic counts**
+       - ``num_reqs = 3``
+       - ``num_scheduled_per_req = [3, 2, 5]``
+       - ``total_num_tokens = 10``
+       - ``max_query_len = 5``
+
+    2. **Request indices & cumulative counts**
+       ``req_indices`` repeats each request index according to its token count::
+
+           req_indices = [0, 0, 0, 1, 1, 2, 2, 2, 2, 2]
+
+       ``cu_num_tokens`` is the cumulative sum (used for ``query_start_loc``)::
+
+           cu_num_tokens = [3, 5, 10]
+
+       ``arange`` is the intra-request position offset::
+
+           arange = [0, 1, 2, 0, 1, 0, 1, 2, 3, 4]
+
+    3. **Positions**
+       ``positions`` = ``num_computed_tokens[req_indices] + arange``::
+
+           positions = [0, 1, 2, 0, 1, 0, 1, 2, 3, 4]
+
+    4. **Input IDs**
+       Gather token IDs from ``token_ids_cpu`` using ``positions``::
+
+           input_ids = [tok_0_0, tok_0_1, tok_0_2,
+                        tok_1_0, tok_1_1,
+                        tok_2_0, tok_2_1, tok_2_2, tok_2_3, tok_2_4]
+
+    5. **query_start_loc & seq_lens**
+       ``query_start_loc`` marks where each request starts in the flat batch::
+
+           query_start_loc = [0, 3, 5, 10]
+
+       ``seq_lens`` records the new total sequence length after this step::
+
+           seq_lens = [3, 2, 5]
+
+    6. **Attention state**
+       Because ``max_query_len == 5 > 1``, this is a prefill step::
+
+           attn_state = AscendAttentionState.ChunkedPrefill
+
+       For decode (``max_query_len == 1``) it would be ``DecodeOnly``.
+
+    7. **Block table & slot mapping**
+       The block table is committed to GPU, and ``compute_slot_mapping`` maps
+       each token position to its physical KV-cache slot.
+
+    8. **Batch padding & attention metadata**
+       ``_determine_batch_execution_and_padding`` decides whether to pad the
+       batch (here ``force_eager=True`` disables CUDA-graph padding).
+       ``_build_attention_metadata`` then constructs the per-layer attention
+       structures (masks, block tables, etc.) consumed by the Ascend backend.
+
+    Returns
+    -------
+    tuple
+        (attn_metadata, total_num_tokens, num_tokens_padded,
+         cudagraph_mode, batch_desc, num_tokens_across_dp)
+    """
     from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
     num_reqs = model_runner.input_batch.num_reqs
