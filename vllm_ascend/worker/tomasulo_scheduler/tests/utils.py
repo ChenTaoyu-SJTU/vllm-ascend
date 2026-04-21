@@ -272,101 +272,38 @@ def prepare_forward_step(
     model_runner,
     num_scheduled_tokens: dict[str, int],
 ):
-    """Prepare all inputs and metadata for a single forward pass.
-
-    This function transforms scheduler output into the tensors and metadata
-    that the Ascend NPU model runner needs for one forward step.  It handles
-    both **prefill** (new tokens have query_len > 1) and **decode** (one new
-    token per request, query_len == 1).
-
-    Example
-    -------
-    Suppose three requests are registered and the scheduler decides to run::
-
-        num_scheduled_tokens = {"0": 3, "1": 2, "2": 5}
-
-    All requests start from ``num_computed_tokens = 0`` (pure prefill).
-
-    Step-by-step data transformation:
-
-    1. **Basic counts**
-       - ``num_reqs = 3``
-       - ``num_scheduled_per_req = [3, 2, 5]``
-       - ``total_num_tokens = 10``
-       - ``max_query_len = 5``
-
-    2. **Request indices & cumulative counts**
-       ``req_indices`` repeats each request index according to its token count::
-
-           req_indices = [0, 0, 0, 1, 1, 2, 2, 2, 2, 2]
-
-       ``cu_num_tokens`` is the cumulative sum (used for ``query_start_loc``)::
-
-           cu_num_tokens = [3, 5, 10]
-
-       ``arange`` is the intra-request position offset::
-
-           arange = [0, 1, 2, 0, 1, 0, 1, 2, 3, 4]
-
-    3. **Positions**
-       ``positions`` = ``num_computed_tokens[req_indices] + arange``::
-
-           positions = [0, 1, 2, 0, 1, 0, 1, 2, 3, 4]
-
-    4. **Input IDs**
-       Gather token IDs from ``token_ids_cpu`` using ``positions``::
-
-           input_ids = [tok_0_0, tok_0_1, tok_0_2,
-                        tok_1_0, tok_1_1,
-                        tok_2_0, tok_2_1, tok_2_2, tok_2_3, tok_2_4]
-
-    5. **query_start_loc & seq_lens**
-       ``query_start_loc`` marks where each request starts in the flat batch::
-
-           query_start_loc = [0, 3, 5, 10]
-
-       ``seq_lens`` records the new total sequence length after this step::
-
-           seq_lens = [3, 2, 5]
-
-    6. **Attention state**
-       Because ``max_query_len == 5 > 1``, this is a prefill step::
-
-           attn_state = AscendAttentionState.ChunkedPrefill
-
-       For decode (``max_query_len == 1``) it would be ``DecodeOnly``.
-
-    7. **Block table & slot mapping**
-       The block table is committed to GPU, and ``compute_slot_mapping`` maps
-       each token position to its physical KV-cache slot.
-
-    8. **Batch padding & attention metadata**
-       ``_determine_batch_execution_and_padding`` decides whether to pad the
-       batch (here ``force_eager=True`` disables CUDA-graph padding).
-       ``_build_attention_metadata`` then constructs the per-layer attention
-       structures (masks, block tables, etc.) consumed by the Ascend backend.
-
-    Returns
-    -------
-    tuple
-        (attn_metadata, total_num_tokens, num_tokens_padded,
-         cudagraph_mode, batch_desc, num_tokens_across_dp)
-    """
+    # Example: num_scheduled_tokens = {"0": 3, "1": 2, "2": 5}
+    # All requests start from num_computed_tokens = 0 (pure prefill).
     from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
+    # num_reqs = 3
     num_reqs = model_runner.input_batch.num_reqs
     req_ids = list(model_runner.input_batch.req_ids)
+
+    # num_scheduled_per_req = [3, 2, 5]
     num_scheduled_per_req = np.array(
         [num_scheduled_tokens[rid] for rid in req_ids], dtype=np.int32
     )
+
+    # total_num_tokens = 3 + 2 + 5 = 10
     total_num_tokens = int(num_scheduled_per_req.sum())
+
+    # max_query_len = max([3, 2, 5]) = 5
     max_query_len = int(num_scheduled_per_req.max())
 
+    # req_indices repeats each request index according to its token count.
+    # [3, 2, 5] -> [0, 0, 0, 1, 1, 2, 2, 2, 2, 2]
     req_indices = np.repeat(np.arange(num_reqs), num_scheduled_per_req)
+
+    # cu_num_tokens is the cumulative sum: [3, 5, 10]
+    # arange is the intra-request position offset: [0, 1, 2, 0, 1, 0, 1, 2, 3, 4]
     cu_num_tokens, arange = model_runner._get_cumsum_and_arange(
         num_scheduled_per_req
     )
 
+    # positions = num_computed_tokens[req_indices] + arange
+    #           = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] + [0, 1, 2, 0, 1, 0, 1, 2, 3, 4]
+    #           = [0, 1, 2, 0, 1, 0, 1, 2, 3, 4]
     positions_np = model_runner.positions.np[:total_num_tokens]
     np.add(
         model_runner.input_batch.num_computed_tokens_cpu[req_indices],
@@ -374,6 +311,11 @@ def prepare_forward_step(
         out=positions_np,
     )
 
+    # token_indices = positions + req_indices * max_model_len
+    # Gather input token IDs from token_ids_cpu.
+    # input_ids = [tok_0_0, tok_0_1, tok_0_2,
+    #              tok_1_0, tok_1_1,
+    #              tok_2_0, tok_2_1, tok_2_2, tok_2_3, tok_2_4]
     token_indices = (
         positions_np
         + req_indices * model_runner.input_batch.token_ids_cpu.shape[1]
@@ -385,11 +327,15 @@ def prepare_forward_step(
         out=model_runner.input_ids.cpu[:total_num_tokens],
     )
 
+    # query_start_loc marks where each request starts in the flat batch.
+    # [0, 3, 5, 10]  (length = num_reqs + 1)
     model_runner.query_start_loc.np[0] = 0
     model_runner.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
     model_runner.query_start_loc.copy_to_gpu()
     model_runner.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 
+    # seq_lens records the total sequence length after this step.
+    # [3, 2, 5] = num_computed_tokens + num_scheduled_per_req
     model_runner.seq_lens.np[:num_reqs] = (
         model_runner.input_batch.num_computed_tokens_cpu[:num_reqs]
         + num_scheduled_per_req
@@ -397,20 +343,26 @@ def prepare_forward_step(
     model_runner.seq_lens.np[num_reqs:] = 0
     model_runner.seq_lens.copy_to_gpu()
 
+    # max_query_len == 5 > 1 -> ChunkedPrefill (prefill step)
+    # max_query_len == 1     -> DecodeOnly (decode step)
     if max_query_len == 1:
         model_runner.attn_state = AscendAttentionState.DecodeOnly
     else:
         model_runner.attn_state = AscendAttentionState.ChunkedPrefill
 
+    # Commit block table to GPU and compute KV-cache slot mapping.
     model_runner.input_batch.block_table.commit_block_table(num_reqs)
     model_runner.input_batch.block_table.compute_slot_mapping(
         req_indices, positions_np
     )
     model_runner.input_batch.block_table.commit_slot_mapping(total_num_tokens)
 
+    # Copy input_ids and positions from CPU to GPU.
     model_runner.input_ids.copy_to_gpu(total_num_tokens)
     model_runner.positions.copy_to_gpu(total_num_tokens)
 
+    # Decide batch execution mode and padding.
+    # force_eager=True disables CUDA-graph padding.
     cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = (
         model_runner._determine_batch_execution_and_padding(
             num_tokens=total_num_tokens,
@@ -423,6 +375,7 @@ def prepare_forward_step(
     )
     num_tokens_padded = batch_desc.num_tokens
 
+    # Build per-layer attention metadata (masks, block tables, etc.).
     attn_metadata, _ = model_runner._build_attention_metadata(
         num_tokens=total_num_tokens,
         num_tokens_padded=num_tokens_padded,
