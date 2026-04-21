@@ -273,32 +273,32 @@ def prepare_forward_step(
     num_scheduled_tokens: dict[str, int],
 ):
     # Example: num_scheduled_tokens = {"0": 3, "1": 2, "2": 5}
-    # All requests start from num_computed_tokens = 0 (pure prefill).
+    # Assume All requests start from num_computed_tokens = 0 in this example (pure prefill).
     from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
     # num_reqs = 3
     num_reqs = model_runner.input_batch.num_reqs
     req_ids = list(model_runner.input_batch.req_ids)
 
-    # num_scheduled_tokens = [3, 2, 5]
-    num_scheduled_tokens = np.array(
+    # num_scheduled_tokens_np = [3, 2, 5]
+    num_scheduled_tokens_np = np.array(
         [num_scheduled_tokens[rid] for rid in req_ids], dtype=np.int32
     )
 
     # total_num_tokens = 3 + 2 + 5 = 10
-    total_num_tokens = int(num_scheduled_tokens.sum())
+    total_num_tokens = int(num_scheduled_tokens_np.sum())
 
     # max_query_len = max([3, 2, 5]) = 5
-    max_query_len = int(num_scheduled_tokens.max())
+    max_query_len = int(num_scheduled_tokens_np.max())
 
     # req_indices repeats each request index according to its token count.
     # [3, 2, 5] -> [0, 0, 0, 1, 1, 2, 2, 2, 2, 2]
-    req_indices = np.repeat(np.arange(num_reqs), num_scheduled_tokens)
+    req_indices = np.repeat(np.arange(num_reqs), num_scheduled_tokens_np)
 
     # cu_num_tokens is the cumulative sum: [3, 5, 10]
     # arange is the intra-request position offset: [0, 1, 2, 0, 1, 0, 1, 2, 3, 4]
     cu_num_tokens, arange = model_runner._get_cumsum_and_arange(
-        num_scheduled_tokens
+        num_scheduled_tokens_np
     )
 
     # positions = num_computed_tokens[req_indices] + arange
@@ -335,10 +335,10 @@ def prepare_forward_step(
     model_runner.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 
     # seq_lens records the total sequence length after this step.
-    # [3, 2, 5] = num_computed_tokens + num_scheduled_tokens
+    # [3, 2, 5] = num_computed_tokens + num_scheduled_tokens_np
     model_runner.seq_lens.np[:num_reqs] = (
         model_runner.input_batch.num_computed_tokens_cpu[:num_reqs]
-        + num_scheduled_tokens
+        + num_scheduled_tokens_np
     )
     model_runner.seq_lens.np[num_reqs:] = 0
     model_runner.seq_lens.copy_to_gpu()
@@ -367,7 +367,7 @@ def prepare_forward_step(
         model_runner._determine_batch_execution_and_padding(
             num_tokens=total_num_tokens,
             num_reqs=num_reqs,
-            num_scheduled_tokens_np=num_scheduled_tokens,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
             max_num_scheduled_tokens=max_query_len,
             use_cascade_attn=False,
             force_eager=True,
