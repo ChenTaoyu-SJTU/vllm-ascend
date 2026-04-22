@@ -20,9 +20,10 @@ from vllm.logger import logger
 import multiprocessing as mp
 import socket
 
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 import pytest
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+if TYPE_CHECKING:
+    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
 class SimpleBlockAllocator:
@@ -270,7 +271,7 @@ def register_forward_test_requests(
 
 
 def prepare_forward_step(
-    model_runner: NPUModelRunner,
+    model_runner: "NPUModelRunner",
     num_scheduled_tokens: dict[str, int],
 ):
     # Example: num_scheduled_tokens = {"0": 3, "1": 2, "2": 5}
