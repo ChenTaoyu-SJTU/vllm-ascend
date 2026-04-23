@@ -24,6 +24,8 @@ from typing import Callable, TYPE_CHECKING
 import pytest
 if TYPE_CHECKING:
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+    from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+    from vllm_ascend.worker.worker import NPUWorker
 
 
 class SimpleBlockAllocator:
